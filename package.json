@@ -10,7 +10,8 @@
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.1",
     "node-fetch": "^2.7.0",
-    "twilio": "^4.20.1"
+    "twilio": "^4.20.1",
+    "twitter-api-v2": "^1.15.2"
   },
   "engines": {
     "node": ">=18.0.0"
