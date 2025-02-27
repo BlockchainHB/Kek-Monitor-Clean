@@ -17,20 +17,40 @@ class TwitterMonitorBot {
         this.heliusService = dependencies.heliusService;
         this.birdeyeService = dependencies.birdeyeService;
         
-        // Initialize in-memory state
-        this.monitoredAccounts = new Map();
-        this.trackedWallets = new Map();
-        this.smsSubscribers = new Map();
-        this.processedTweets = new Set();
+        // Initialize state object
+        this.state = {
+            monitoredAccounts: new Map(),
+            trackedWallets: new Map(),
+            smsSubscribers: new Map(),
+            processedTweets: new Set(),
+            tokenMentions: new Map(),
+            lastSearchTime: new Map()
+        };
+
+        // Initialize Twitter client
+        this.twitter = new TwitterApi({
+            appKey: process.env.TWITTER_API_KEY,
+            appSecret: process.env.TWITTER_API_KEY_SECRET,
+            accessToken: process.env.TWITTER_ACCESS_TOKEN,
+            accessSecret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
+        });
+
+        // Initialize rate limit manager
+        this.twitterRateLimitManager = new RateLimitManager({
+            defaultLimit: {
+                windowSizeMinutes: 15,
+                requestsPerWindow: 450,
+            },
+            safetyMargin: 0.9
+        });
 
         // Initialize Twilio if credentials exist
         if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-            const twilio = require('twilio');
             this.twilioClient = twilio(
                 process.env.TWILIO_ACCOUNT_SID,
                 process.env.TWILIO_AUTH_TOKEN
             );
-            console.debug('Twilio client initialized');
+            console.log('Twilio client initialized');
         }
 
         // Store config
@@ -41,6 +61,9 @@ class TwitterMonitorBot {
         this.vipChannel = null;
         this.walletsChannel = null;
         this.solanaChannel = null;
+
+        // Initialize monitoring interval
+        this.monitoringInterval = 60000; // 1 minute default
     }
 
     validateDependencies(deps) {
@@ -2072,6 +2095,8 @@ class TwitterMonitorBot {
                         return;
                     }
 
+                    console.log(`Monitoring ${accounts.length} accounts...`);
+
                     // Process accounts in batches to respect rate limits
                     const BATCH_SIZE = 5;
                     for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
@@ -2080,10 +2105,10 @@ class TwitterMonitorBot {
                     }
                 } catch (error) {
                     if (error.code === 429) {
-                        await this.handleRateLimit(error);
+                        console.log('Rate limit hit, waiting before retry...');
+                        await new Promise(resolve => setTimeout(resolve, 60000));
                     } else {
                         console.error('Error in monitor loop:', error);
-                        await this.handleError(error);
                     }
                 }
             };
@@ -2091,6 +2116,9 @@ class TwitterMonitorBot {
             // Start the monitoring interval
             this.monitoringInterval = setInterval(monitorAccounts, this.config.monitoring.interval);
             console.log('✅ Twitter monitoring started');
+
+            // Run initial check
+            monitorAccounts().catch(console.error);
         } catch (error) {
             console.error('Failed to start monitoring:', error);
             throw error;
@@ -2100,7 +2128,7 @@ class TwitterMonitorBot {
     async batchProcessTweets(accounts) {
         try {
             for (const account of accounts) {
-                const lastCheck = this.lastSearchTime.get(account.id) || 0;
+                const lastCheck = this.state.lastSearchTime.get(account.id) || 0;
                 const now = Date.now();
                 const lastTweetId = this.state.monitoredAccounts.get(account.id)?.lastTweetId;
 
@@ -2109,15 +2137,20 @@ class TwitterMonitorBot {
                     continue;
                 }
 
+                console.log(`Checking tweets for account ${account.username}...`);
+
                 await this.twitterRateLimitManager.scheduleRequest(
                     async () => {
                         const params = {
-                            ...this.searchConfig,
+                            'tweet.fields': ['author_id', 'created_at', 'text'],
+                            'expansions': ['author_id'],
+                            'user.fields': ['username'],
                             since_id: lastTweetId
                         };
 
                         const tweets = await this.twitter.v2.userTimeline(account.id, params);
                         if (tweets.data) {
+                            console.log(`Found ${tweets.data.length} new tweets for ${account.username}`);
                             // Process tweets in chronological order
                             for (const tweet of tweets.data.reverse()) {
                                 await this.processTweet(tweet, account, tweets.includes);
@@ -2127,15 +2160,11 @@ class TwitterMonitorBot {
                     'users/:id/tweets'
                 );
 
-                this.lastSearchTime.set(account.id, now);
+                this.state.lastSearchTime.set(account.id, now);
             }
         } catch (error) {
-            if (error.code === 'RATE_LIMIT') {
-                console.log('Rate limit hit, will retry on next interval');
-                return;
-            }
             console.error('Error processing tweets batch:', error);
-            throw error; // Propagate error to be handled by the monitoring loop
+            throw error;
         }
     }
 
