@@ -1,15 +1,20 @@
 require('dotenv').config();
-
 const { Client, GatewayIntentBits } = require('discord.js');
 const TwitterMonitorBot = require('./core/TwitterMonitorBot');
-const BirdeyeService = require('./core/BirdeyeService');
 const HeliusService = require('./core/HeliusService');
+const BirdeyeService = require('./core/BirdeyeService');
+
+// Validate required environment variables
+if (!process.env.DISCORD_BOT_TOKEN) {
+    console.error('❌ DISCORD_BOT_TOKEN is required but not set in environment variables');
+    process.exit(1);    
+}
+
+console.log('🚀 Starting Twitter Monitor Bot...');
+console.log('Environment:', process.env.NODE_ENV || 'development');
 
 async function main() {
     try {
-        console.log('🚀 Starting Twitter Monitor Bot...');
-        console.log('Environment:', process.env.NODE_ENV);
-
         // Initialize Discord client with required intents
         const client = new Client({
             intents: [
@@ -20,36 +25,47 @@ async function main() {
         });
 
         // Initialize services
-        const birdeyeService = new BirdeyeService(process.env.BIRDEYE_API_KEY);
-        const heliusService = new HeliusService(process.env.HELIUS_API_KEY, birdeyeService);
+        const heliusService = new HeliusService();
+        const birdeyeService = new BirdeyeService();
+
+        // Basic config
+        const config = {
+            guildId: process.env.DISCORD_GUILD_ID,
+            tweetsChannelId: process.env.DISCORD_TWEETS_CHANNEL,
+            vipChannelId: process.env.DISCORD_VIP_CHANNEL,
+            walletsChannelId: process.env.DISCORD_WALLETS_CHANNEL,
+            solanaChannelId: process.env.DISCORD_SOLANA_CHANNEL,
+            monitoring: {
+                interval: 60000 // 1 minute
+            }
+        };
 
         // Initialize bot with dependencies
         const bot = new TwitterMonitorBot({
-            client,  // Pass the Discord client
+            client,
             heliusService,
             birdeyeService,
-            config: {
-                twitterApiKey: process.env.TWITTER_API_KEY,
-                twitterApiSecret: process.env.TWITTER_API_KEY_SECRET,
-                twitterAccessToken: process.env.TWITTER_ACCESS_TOKEN,
-                twitterAccessSecret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
-                discordToken: process.env.DISCORD_BOT_TOKEN,
-                clientId: process.env.DISCORD_CLIENT_ID,
-                guildId: process.env.DISCORD_GUILD_ID,
-                tweetsChannelId: process.env.DISCORD_TWEETS_CHANNEL,
-                vipChannelId: process.env.DISCORD_VIP_CHANNEL,
-                walletsChannelId: process.env.DISCORD_WALLETS_CHANNEL,
-                solanaChannelId: process.env.DISCORD_SOLANA_CHANNEL
-            }
+            config
         });
 
         // Start the bot
         await bot.start();
 
     } catch (error) {
-        console.error('❌ Fatal error:', error);
+        console.error('Failed to start bot:', error);
         process.exit(1);
     }
 }
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+    console.error('❌ Fatal error:', error);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (error) => {
+    console.error('❌ Unhandled rejection:', error);
+    process.exit(1);
+});
 
 main(); 
