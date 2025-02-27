@@ -1766,7 +1766,7 @@ class TwitterMonitorBot {
     // Handle webhook events from Helius
     async handleWebhook(data) {
         try {
-            console.log('[DEBUG] Received Helius webhook data:', JSON.stringify(data, null, 2));
+            console.log('[DEBUG] Received webhook data:', JSON.stringify(data, null, 2));
 
             // Get the wallet channel
             const channel = this.walletsChannel;
@@ -1815,12 +1815,6 @@ class TwitterMonitorBot {
                         console.log('[DEBUG] Skipping stablecoin purchase transaction');
                         continue;
                     }
-
-                    // Skip if value is under $100 (unless it's a VIP wallet) - removed for testing
-                    /*if (totalUsdValue < 100 && !wallet.is_vip) {
-                        console.log('[DEBUG] Skipping low value transaction: $' + totalUsdValue);
-                        continue;
-                    }*/
 
                     // Create transaction embed
                     const embed = {
@@ -1931,6 +1925,7 @@ class TwitterMonitorBot {
                                     value: `${buyRatio}% (${tokenInfo.buys24h}/${tokenInfo.trades24h} trades)`,
                                     inline: true
                                 });
+                            }
                             
                             // Add unique wallet activity
                             if (tokenInfo.uniqueWallets24h) tokenFields.push({
@@ -1963,13 +1958,11 @@ class TwitterMonitorBot {
                             );
                         }
                     }
-
                 } catch (txError) {
                     console.error('[ERROR] Error processing transaction:', txError);
                     continue;
                 }
             }
-
         } catch (error) {
             console.error('[ERROR] Error handling webhook:', error);
         }
