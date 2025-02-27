@@ -55,7 +55,7 @@ class TwitterMonitorBot {
             console.log('Starting Twitter Monitor Bot...');
             
             // Login to Discord first
-            await this.client.login(process.env.DISCORD_TOKEN);
+            await this.client.login(process.env.DISCORD_BOT_TOKEN);
             console.log('✅ Logged into Discord');
 
             // Register commands first
@@ -103,7 +103,7 @@ class TwitterMonitorBot {
             await this.heliusService.loadWalletsFromJson();
             
             console.log('🔄 Logging into Discord...');
-            await this.client.login(process.env.DISCORD_TOKEN);
+            await this.client.login(process.env.DISCORD_BOT_TOKEN);
             
             console.log('🔄 Starting initialization process...');
             
