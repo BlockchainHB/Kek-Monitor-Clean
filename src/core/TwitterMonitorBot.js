@@ -54,28 +54,25 @@ class TwitterMonitorBot {
         try {
             console.log('Starting Twitter Monitor Bot...');
             
-            // Login to Discord
-            await this.client.login(this.config.discordToken);
+            // Login to Discord first
+            await this.client.login(process.env.DISCORD_TOKEN);
             console.log('✅ Logged into Discord');
 
-            // Set up commands
-            await this.setupCommandHandling();
+            // Register commands first
+            console.log('🔄 Registering application commands...');
             await this.registerCommands();
             console.log('✅ Commands registered');
 
-            // Load tracked wallets from file
+            // Then set up command handling
+            console.log('🔄 Setting up command handling...');
+            await this.setupCommandHandling();
+            console.log('✅ Command handling setup complete');
+
+            // Rest of initialization
             await this.loadTrackedWallets();
-            console.log('✅ Tracked wallets loaded');
-
-            // Test channel access
             await this.testChannelAccess();
-            console.log('✅ Channel access verified');
-
-            // Start monitoring systems
             await this.startMonitoring();
-            console.log('✅ Monitoring systems started');
 
-            console.log('🤖 Bot is ready!');
         } catch (error) {
             console.error('Failed to start bot:', error);
             throw error;
