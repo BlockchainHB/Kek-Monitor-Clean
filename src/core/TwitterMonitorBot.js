@@ -16,33 +16,16 @@ class TwitterMonitorBot {
         this.client = dependencies.client;
         this.heliusService = dependencies.heliusService;
         this.birdeyeService = dependencies.birdeyeService;
+        this.config = dependencies.config;
         
-        // Initialize state object
-        this.state = {
-            monitoredAccounts: new Map(),
-            trackedWallets: new Map(),
-            smsSubscribers: new Map(),
-            processedTweets: new Set(),
-            tokenMentions: new Map(),
-            lastSearchTime: new Map()
-        };
-
-        // Initialize Twitter client
-        this.twitter = new TwitterApi({
-            appKey: process.env.TWITTER_API_KEY,
-            appSecret: process.env.TWITTER_API_KEY_SECRET,
-            accessToken: process.env.TWITTER_ACCESS_TOKEN,
-            accessSecret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
-        });
-
-        // Initialize rate limit manager
-        this.twitterRateLimitManager = new RateLimitManager({
-            defaultLimit: {
-                windowSizeMinutes: 15,
-                requestsPerWindow: 450,
-            },
-            safetyMargin: 0.9
-        });
+        // Simple runtime state - no persistence
+        this.monitoredAccounts = new Map();
+        this.trackedWallets = new Map();
+        this.smsSubscribers = new Map();
+        this.processedTweets = new Set();
+        this.lastSearchTime = new Map();
+        this.tokenMentions = new Map();
+        this.trackedTokens = new Map();
 
         // Initialize Twilio if credentials exist
         if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
@@ -50,20 +33,14 @@ class TwitterMonitorBot {
                 process.env.TWILIO_ACCOUNT_SID,
                 process.env.TWILIO_AUTH_TOKEN
             );
-            console.log('Twilio client initialized');
+            console.debug('Twilio client initialized');
         }
 
-        // Store config
-        this.config = dependencies.config;
-        
         // Initialize channel properties as null
         this.tweetsChannel = null;
         this.vipChannel = null;
         this.walletsChannel = null;
         this.solanaChannel = null;
-
-        // Initialize monitoring interval
-        this.monitoringInterval = 60000; // 1 minute default
     }
 
     validateDependencies(deps) {
@@ -77,25 +54,24 @@ class TwitterMonitorBot {
         try {
             console.log('Starting Twitter Monitor Bot...');
             
-            // Login to Discord first
-            await this.client.login(process.env.DISCORD_BOT_TOKEN);
+            // Login to Discord
+            await this.client.login(this.config.discordToken);
             console.log('✅ Logged into Discord');
 
-            // Register commands first
-            console.log('🔄 Registering application commands...');
+            // Set up commands
+            await this.setupCommandHandling();
             await this.registerCommands();
             console.log('✅ Commands registered');
 
-            // Then set up command handling
-            console.log('🔄 Setting up command handling...');
-            await this.setupCommandHandling();
-            console.log('✅ Command handling setup complete');
-
-            // Rest of initialization
-            await this.loadTrackedWallets();
+            // Test channel access
             await this.testChannelAccess();
-            await this.startMonitoring();
+            console.log('✅ Channel access verified');
 
+            // Start monitoring systems
+            await this.startMonitoring();
+            console.log('✅ Monitoring systems started');
+
+            console.log('🤖 Bot is ready!');
         } catch (error) {
             console.error('Failed to start bot:', error);
             throw error;
@@ -118,89 +94,45 @@ class TwitterMonitorBot {
         }
     }
 
-    async initialize() {
-        try {
-            console.log('🚀 Initializing TwitterMonitorBot...');
-            
-            // Load wallets first
-            await this.heliusService.loadWalletsFromJson();
-            
-            console.log('🔄 Logging into Discord...');
-            await this.client.login(process.env.DISCORD_BOT_TOKEN);
-            
-            console.log('🔄 Starting initialization process...');
-            
-            // Set up commands first
-            await this.setupCommandHandling();
-            await this.registerCommands();
-
-            // Then validate channel access
-            await this.testChannelAccess();
-
-            // Load wallets and setup webhook
-            console.log('[DEBUG] Loading tracked wallets...');
-            await this.loadTrackedWallets();
-            
-            if (this.state.trackedWallets.size > 0) {
-                console.log('[DEBUG] Setting up Helius webhook...');
-                await this.setupHeliusWebhook();
-                console.log(`[DEBUG] Helius webhook configured for ${this.state.trackedWallets.size} wallets`);
-            }
-
-            // Start monitoring systems
-            this.startMonitoring();
-            this.startWalletMonitoring();
-
-            console.log('[DEBUG] Initialization complete');
-        } catch (error) {
-            console.error('❌ Error during initialization:', error);
-            throw error;
-        }
-    }
-
     async getMonitoredAccounts() {
-        return Array.from(this.state.monitoredAccounts.values());
+        return Array.from(this.monitoredAccounts.values());
     }
 
     async addMonitoredAccount(account) {
-        this.state.monitoredAccounts.set(account.id, {
+        this.monitoredAccounts.set(account.id, {
             ...account,
-            lastTweetId: null,
-            isVIP: false
+            lastTweetId: null
         });
         return true;
     }
 
     async removeMonitoredAccount(twitterId) {
-        return this.state.monitoredAccounts.delete(twitterId);
+        return this.monitoredAccounts.delete(twitterId);
     }
 
     async updateLastTweetId(twitterId, lastTweetId) {
-        const account = this.state.monitoredAccounts.get(twitterId);
+        const account = this.monitoredAccounts.get(twitterId);
         if (account) {
             account.lastTweetId = lastTweetId;
-            this.state.monitoredAccounts.set(twitterId, account);
+            this.monitoredAccounts.set(twitterId, account);
         }
     }
 
     async isTweetProcessed(tweetId) {
-        return this.state.processedTweets.has(tweetId);
+        return this.processedTweets.has(tweetId);
     }
 
     async addProcessedTweet(tweet) {
-        this.state.processedTweets.add(tweet.id);
+        this.processedTweets.add(tweet.id);
     }
 
     async addTokenMention(tweetId, tokenAddress) {
-        if (!this.state.tokenMentions) {
-            this.state.tokenMentions = new Map();
-        }
-        this.state.tokenMentions.set(tweetId, tokenAddress);
+        this.tokenMentions.set(tweetId, tokenAddress);
     }
 
     async addTrackedToken(address, tweetId) {
-        if (!this.state.trackedTokens.has(address)) {
-            this.state.trackedTokens.set(address, {
+        if (!this.trackedTokens.has(address)) {
+            this.trackedTokens.set(address, {
                 address,
                 first_seen_tweet_id: tweetId,
                 created_at: new Date().toISOString()
@@ -209,7 +141,7 @@ class TwitterMonitorBot {
     }
 
     async addSMSSubscriber(discordUserId, phoneNumber) {
-        this.state.smsSubscribers.set(discordUserId, {
+        this.smsSubscribers.set(discordUserId, {
             phone: phoneNumber,
             discord_user_id: discordUserId
         });
@@ -217,15 +149,15 @@ class TwitterMonitorBot {
     }
 
     async removeSMSSubscriber(discordUserId) {
-        return this.state.smsSubscribers.delete(discordUserId);
+        return this.smsSubscribers.delete(discordUserId);
     }
 
     async getSMSSubscriber(discordUserId) {
-        return this.state.smsSubscribers.get(discordUserId);
+        return this.smsSubscribers.get(discordUserId);
     }
 
     async getActiveSMSSubscribers() {
-        return Array.from(this.state.smsSubscribers.values());
+        return Array.from(this.smsSubscribers.values());
     }
 
     async checkAccount(account) {
@@ -344,17 +276,17 @@ class TwitterMonitorBot {
                 for (const address of solanaAddresses) {
                     try {
                         // Let Birdeye validate and get token info
-                                    const tokenInfo = await this.birdeyeService.getTokenInfo(address);
-                                    if (tokenInfo) {
+                        const tokenInfo = await this.birdeyeService.getTokenInfo(address);
+                        if (tokenInfo) {
                             contractFound = true;
                             // Store token mention
                             await this.addTokenMention(tweet.id, address);
                             
                             // Send contract notification with token info
-                                await this.sendSolanaNotification({
+                            await this.sendSolanaNotification({
                                 tweet,
                                 account,
-                                            includes,
+                                includes,
                                 tokenInfo,
                                 address
                             });
@@ -394,25 +326,24 @@ class TwitterMonitorBot {
             await this.addProcessedTweet(tweet);
             await this.updateLastTweetId(account.id, tweet.id);
 
-            } catch (error) {
+        } catch (error) {
             console.error('Error processing tweet:', error);
-                throw error;
+            throw error;
         }
     }
 
     async sendTweetNotification(tweet) {
         try {
-            const author = this.state.monitoredAccounts.get(tweet.author_id);
+            const author = this.monitoredAccounts.get(tweet.author_id);
             if (!author) {
                 console.error(`Author not found for tweet ${tweet.id}`);
                 return;
             }
 
             // Get appropriate channel based on VIP status
-            const channelId = author.is_vip ? this.state.channels.vip : this.state.channels.tweets;
-            const channel = this.state.guild.channels.cache.get(channelId);
+            const channel = author.is_vip ? this.vipChannel : this.tweetsChannel;
             if (!channel) {
-                console.error('Channel not found in guild');
+                console.error('Channel not found');
                 return;
             }
 
@@ -457,11 +388,11 @@ class TwitterMonitorBot {
             }
 
             // Send notification with all embeds
-                    await channel.send({ 
+            await channel.send({ 
                 content: author.is_vip ? '@everyone New VIP Tweet! 🌟' : null,
                 embeds: embeds,
-                        allowedMentions: { parse: ['everyone'] }
-                    });
+                allowedMentions: { parse: ['everyone'] }
+            });
 
             // Send SMS if enabled and VIP
             if (this.config.twilio.enabled && author.is_vip) {
@@ -490,6 +421,7 @@ class TwitterMonitorBot {
 
         } catch (error) {
             console.error('[ERROR] Error sending tweet notification:', error);
+            throw error;
         }
     }
 
@@ -519,16 +451,16 @@ class TwitterMonitorBot {
                 }
             ],
             color: 0xFF0000,
-                timestamp: new Date().toISOString()
-            };
+            timestamp: new Date().toISOString()
+        };
 
         // Send to appropriate channels with @everyone for contract detection
         if (this.channels.solana) {
             await this.channels.solana.send({
                 content: '@everyone New Solana contract detected! 🚨',
                 embeds: [embed],
-                    allowedMentions: { parse: ['everyone'] }
-                });
+                allowedMentions: { parse: ['everyone'] }
+            });
         }
     }
 
@@ -715,7 +647,7 @@ class TwitterMonitorBot {
                 if (!interaction.replied) {
                     await interaction.reply({
                         content: '❌ An error occurred while processing the command',
-                            ephemeral: true
+                        ephemeral: true
                     }).catch(console.error);
                 }
             }
@@ -827,7 +759,7 @@ class TwitterMonitorBot {
             const username = interaction.options.getString('twitter_id').toLowerCase().replace('@', '');
 
             // Check if account is being monitored
-            const account = Array.from(this.state.monitoredAccounts.values())
+            const account = Array.from(this.monitoredAccounts.values())
                 .find(a => a.username.toLowerCase() === username);
 
             if (!account) {
@@ -1287,7 +1219,7 @@ class TwitterMonitorBot {
             const userId = interaction.user.id;
 
             // Store in memory
-            this.state.smsSubscribers.set(userId, {
+            this.smsSubscribers.set(userId, {
                 phone: phone,
                 discord_id: userId
             });
@@ -1311,9 +1243,9 @@ class TwitterMonitorBot {
 
             // Remove from in-memory state
             let removed = false;
-            for (const [userId, data] of this.state.smsSubscribers.entries()) {
+            for (const [userId, data] of this.smsSubscribers.entries()) {
                 if (data.phone === phone) {
-                    this.state.smsSubscribers.delete(userId);
+                    this.smsSubscribers.delete(userId);
                     removed = true;
                     break;
                 }
@@ -1367,7 +1299,7 @@ class TwitterMonitorBot {
         try {
             if (!this.twilio || !this.twilioPhone) {
                 console.error('[ERROR] Twilio not configured');
-                    return false;
+                return false;
             }
 
             await this.twilio.messages.create({
@@ -1428,21 +1360,15 @@ class TwitterMonitorBot {
         try {
             console.log('🔄 Registering application commands...');
             
-            // Get the guild first
-            const guild = await this.client.guilds.fetch(this.config.guildId);
-            if (!guild) {
-                throw new Error('Could not find guild with ID ' + this.config.guildId);
-            }
-
             const commands = [
                 {
                     name: 'monitor',
                     description: 'Monitor a Twitter account for tweets',
                     options: [{
-                        name: 'twitter_id',
-                        description: 'Twitter username to monitor',
+                            name: 'twitter_id',
+                            description: 'Twitter username to monitor',
                         type: ApplicationCommandOptionType.String,
-                        required: true
+                            required: true
                     }]
                 },
                 {
@@ -1629,6 +1555,11 @@ class TwitterMonitorBot {
             ];
 
             // Register commands with Discord
+            const guild = await this.client.guilds.fetch(this.config.guildId);
+            if (!guild) {
+                throw new Error('Guild not found during command registration');
+            }
+
             await guild.commands.set(commands);
             console.log('✅ Application commands registered successfully');
         } catch (error) {
@@ -1763,52 +1694,16 @@ class TwitterMonitorBot {
         try {
             console.log('[DEBUG] Setting up Helius webhook...');
 
-            // Get all tracked wallets
-            const walletAddresses = Array.from(this.state.trackedWallets.keys());
+            // Get currently tracked wallets
+            const walletAddresses = Array.from(this.trackedWallets.keys());
             if (walletAddresses.length === 0) {
                 console.log('[DEBUG] No wallets to track, skipping webhook setup');
                 return;
             }
 
-            console.log(`[DEBUG] Found ${walletAddresses.length} wallets to track`);
-
-            // Get existing webhooks
-            const webhooks = await this.helius.getWebhooks();
-            console.log('[DEBUG] Current webhooks:', JSON.stringify(webhooks, null, 2));
-
-            let webhook = webhooks.find(w => w.webhookURL === this.config.helius.webhookUrl);
-
-            if (webhook) {
-                console.log('[DEBUG] Updating existing webhook...');
-                webhook = await this.helius.updateWebhook({
-                    webhookID: webhook.webhookID,
-                    accountAddresses: walletAddresses,
-                    transactionTypes: ['ANY'],
-                    webhookURL: this.config.helius.webhookUrl,
-                    authHeader: this.config.helius.authHeader
-                });
-            } else {
-                console.log('[DEBUG] Creating new webhook...');
-                webhook = await this.helius.createWebhook({
-                    accountAddresses: walletAddresses,
-                    transactionTypes: ['ANY'],
-                    webhookURL: this.config.helius.webhookUrl,
-                    authHeader: this.config.helius.authHeader
-                });
-            }
-
-            console.log('[DEBUG] Webhook setup complete:', JSON.stringify(webhook, null, 2));
-
-            // Verify webhook is active
-            const activeWebhooks = await this.helius.getWebhooks();
-            const isActive = activeWebhooks.some(w => w.webhookID === webhook.webhookID && w.active);
-            
-            if (!isActive) {
-                throw new Error('Webhook was created but is not active');
-            }
-
-            console.log('[SUCCESS] Helius webhook is active and monitoring wallets');
-            return webhook;
+            // Update webhook with current wallets
+            await this.heliusService.updateWebhookAddresses(walletAddresses);
+            console.log('[DEBUG] Helius webhook updated with current wallets');
 
         } catch (error) {
             console.error('[ERROR] Failed to setup Helius webhook:', error);
@@ -1816,10 +1711,9 @@ class TwitterMonitorBot {
         }
     }
 
-    // Remove the polling-based monitorWallets method since we're using webhooks now
+    // Simplified wallet monitoring
     startWalletMonitoring() {
-        const walletCount = this.state.trackedWallets.size;
-        console.log(`[DEBUG] Wallet monitoring active - ${walletCount} wallets configured`);
+        console.log(`[DEBUG] Wallet monitoring active - ${this.trackedWallets.size} wallets configured`);
         console.log('[DEBUG] Webhook endpoint ready for Helius notifications');
     }
 
@@ -1834,7 +1728,7 @@ class TwitterMonitorBot {
             }
 
             // Store in memory
-            this.state.trackedWallets.set(address, {
+            this.trackedWallets.set(address, {
                 address,
                 name: name || address.slice(0, 4) + '...' + address.slice(-4),
                 added_by: interaction.user.id
@@ -1854,13 +1748,13 @@ class TwitterMonitorBot {
         try {
             const address = interaction.options.getString('address');
 
-            if (!this.state.trackedWallets.has(address)) {
+            if (!this.trackedWallets.has(address)) {
                 await interaction.reply('This wallet is not being tracked.');
                 return;
             }
 
             // Remove from memory
-            this.state.trackedWallets.delete(address);
+            this.trackedWallets.delete(address);
 
             await interaction.reply(`✅ Stopped tracking wallet: ${address}`);
         } catch (error) {
@@ -1875,17 +1769,17 @@ class TwitterMonitorBot {
             console.log('[DEBUG] Received Helius webhook data:', JSON.stringify(data, null, 2));
 
             // Get the wallet channel
-            const channel = this.state.channels.wallets;
+            const channel = this.walletsChannel;
             if (!channel) {
                 console.error('[ERROR] Wallet notification channel not found');
-                    return;
-                }
+                return;
+            }
 
             // Process each transaction
             for (const transaction of data) {
                 try {
                     // Get wallet info from tracked wallets
-                    const wallet = this.state.trackedWallets.get(transaction.accountData.account);
+                    const wallet = this.trackedWallets.get(transaction.accountData.account);
                     if (!wallet) {
                         console.log('[DEBUG] Transaction for untracked wallet:', transaction.accountData.account);
                         continue;
@@ -1919,8 +1813,8 @@ class TwitterMonitorBot {
                     // Skip if it's a stablecoin purchase
                     if (isStablecoinPurchase) {
                         console.log('[DEBUG] Skipping stablecoin purchase transaction');
-                    continue;
-                }
+                        continue;
+                    }
 
                     // Skip if value is under $100 (unless it's a VIP wallet) - removed for testing
                     /*if (totalUsdValue < 100 && !wallet.is_vip) {
@@ -2068,7 +1962,6 @@ class TwitterMonitorBot {
                                 wallet.discord_user_id
                             );
                         }
-                        }
                     }
 
                 } catch (txError) {
@@ -2091,11 +1984,8 @@ class TwitterMonitorBot {
                 try {
                     const accounts = await this.getMonitoredAccounts();
                     if (accounts.length === 0) {
-                        console.log('No accounts to monitor');
-                        return;
+                        return; // No accounts to monitor yet
                     }
-
-                    console.log(`Monitoring ${accounts.length} accounts...`);
 
                     // Process accounts in batches to respect rate limits
                     const BATCH_SIZE = 5;
@@ -2105,10 +1995,10 @@ class TwitterMonitorBot {
                     }
                 } catch (error) {
                     if (error.code === 429) {
-                        console.log('Rate limit hit, waiting before retry...');
-                        await new Promise(resolve => setTimeout(resolve, 60000));
+                        await this.handleRateLimit(error);
                     } else {
                         console.error('Error in monitor loop:', error);
+                        await this.handleError(error);
                     }
                 }
             };
@@ -2116,9 +2006,6 @@ class TwitterMonitorBot {
             // Start the monitoring interval
             this.monitoringInterval = setInterval(monitorAccounts, this.config.monitoring.interval);
             console.log('✅ Twitter monitoring started');
-
-            // Run initial check
-            monitorAccounts().catch(console.error);
         } catch (error) {
             console.error('Failed to start monitoring:', error);
             throw error;
@@ -2128,29 +2015,24 @@ class TwitterMonitorBot {
     async batchProcessTweets(accounts) {
         try {
             for (const account of accounts) {
-                const lastCheck = this.state.lastSearchTime.get(account.id) || 0;
+                const lastCheck = this.lastSearchTime.get(account.id) || 0;
                 const now = Date.now();
-                const lastTweetId = this.state.monitoredAccounts.get(account.id)?.lastTweetId;
+                const lastTweetId = this.monitoredAccounts.get(account.id)?.lastTweetId;
 
                 // Only check if enough time has passed
                 if (now - lastCheck < this.monitoringInterval) {
                     continue;
                 }
 
-                console.log(`Checking tweets for account ${account.username}...`);
-
                 await this.twitterRateLimitManager.scheduleRequest(
                     async () => {
                         const params = {
-                            'tweet.fields': ['author_id', 'created_at', 'text'],
-                            'expansions': ['author_id'],
-                            'user.fields': ['username'],
+                            ...this.searchConfig,
                             since_id: lastTweetId
                         };
 
                         const tweets = await this.twitter.v2.userTimeline(account.id, params);
                         if (tweets.data) {
-                            console.log(`Found ${tweets.data.length} new tweets for ${account.username}`);
                             // Process tweets in chronological order
                             for (const tweet of tweets.data.reverse()) {
                                 await this.processTweet(tweet, account, tweets.includes);
@@ -2160,11 +2042,15 @@ class TwitterMonitorBot {
                     'users/:id/tweets'
                 );
 
-                this.state.lastSearchTime.set(account.id, now);
+                this.lastSearchTime.set(account.id, now);
             }
         } catch (error) {
+            if (error.code === 'RATE_LIMIT') {
+                console.log('Rate limit hit, will retry on next interval');
+                return;
+            }
             console.error('Error processing tweets batch:', error);
-            throw error;
+            throw error; // Propagate error to be handled by the monitoring loop
         }
     }
 
@@ -2198,10 +2084,6 @@ class TwitterMonitorBot {
     }
 
     async loadTrackedWallets() {
-        // Initialize wallet tracking state if not exists
-        if (!this.trackedWallets) {
-            this.trackedWallets = new Map();
-        }
         return Array.from(this.trackedWallets.values());
     }
 }

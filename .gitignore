@@ -1,23 +1,4 @@
-# Dependencies
 node_modules/
-
-# Environment variables
 .env
-.env.*
-
-# Logs
+logs/
 *.log
-npm-debug.log*
-
-# OS
-.DS_Store
-
-# IDE
-.vscode/
-.idea/
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
