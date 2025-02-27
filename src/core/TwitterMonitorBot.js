@@ -1405,15 +1405,21 @@ class TwitterMonitorBot {
         try {
             console.log('🔄 Registering application commands...');
             
+            // Get the guild first
+            const guild = await this.client.guilds.fetch(this.config.guildId);
+            if (!guild) {
+                throw new Error('Could not find guild with ID ' + this.config.guildId);
+            }
+
             const commands = [
                 {
                     name: 'monitor',
                     description: 'Monitor a Twitter account for tweets',
                     options: [{
-                            name: 'twitter_id',
-                            description: 'Twitter username to monitor',
+                        name: 'twitter_id',
+                        description: 'Twitter username to monitor',
                         type: ApplicationCommandOptionType.String,
-                            required: true
+                        required: true
                     }]
                 },
                 {
@@ -1600,11 +1606,7 @@ class TwitterMonitorBot {
             ];
 
             // Register commands with Discord
-            if (!this.state.guild) {
-                throw new Error('Guild not found during command registration');
-            }
-
-            await this.state.guild.commands.set(commands);
+            await guild.commands.set(commands);
             console.log('✅ Application commands registered successfully');
         } catch (error) {
             console.error('❌ Error registering commands:', error);
