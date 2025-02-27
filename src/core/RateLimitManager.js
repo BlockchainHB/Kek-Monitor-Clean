@@ -5,7 +5,10 @@ class RateLimitManager extends EventEmitter {
     constructor(config = {}) {
         super();
         
-        this.config = config;
+        this.config = {
+            ...config,
+            safetyMargin: config.safetyMargin || 0.9  // Default safety margin if not provided
+        };
         this.state = {
             windows: new Map(),
             queue: [],
@@ -24,9 +27,9 @@ class RateLimitManager extends EventEmitter {
     }
 
     setupEventHandlers() {
-        emitter.on(EVENTS.RATE_LIMIT_EXCEEDED, () => {
-            this.emit('debug', 'Rate limit exceeded, waiting for reset...');
-            this.resetWindow();
+        emitter.on(EVENTS.RATE_LIMIT_EXCEEDED, ({ endpoint }) => {
+            this.emit('debug', `Rate limit exceeded for ${endpoint}, waiting for reset...`);
+            this.resetWindow(endpoint);
         });
     }
 
@@ -50,55 +53,55 @@ class RateLimitManager extends EventEmitter {
             requestCount: 0
         });
         this.emit('debug', `Rate limit window reset for ${endpoint}`);
-        emitter.emit(EVENTS.RATE_LIMIT_RESET);
+        emitter.emit(EVENTS.RATE_LIMIT_RESET, { endpoint });
     }
 
     async scheduleRequest(requestFn, endpoint = 'default') {
-        return new Promise(async (resolve, reject) => {
-            try {
-                const limits = this.getEndpointLimits(endpoint);
-                const window = this.getOrCreateWindow(endpoint);
+        try {
+            const limits = this.getEndpointLimits(endpoint);
+            let window = this.getOrCreateWindow(endpoint);
 
-                // Check if this is a batch request
-                const isBatchEndpoint = endpoint === 'tweets/search/recent';
-                if (isBatchEndpoint) {
-                    await this.handleBatchRequest(requestFn, limits, window, resolve, reject);
-                    return;
-                }
-
-                // Standard request handling
-                const now = Date.now();
-                const windowSize = limits.windowSizeMinutes * 60 * 1000;
-                if (now - window.startTime >= windowSize) {
-                    this.resetWindow(endpoint);
-                }
-
-                // Check if we're within rate limits
-                const safeLimit = Math.floor(limits.requestsPerWindow * this.config.safetyMargin);
-                if (window.requestCount >= safeLimit) {
-                    const waitTime = windowSize - (now - window.startTime);
-                    this.emit('debug', `Rate limit approaching for ${endpoint}, waiting ${waitTime}ms`);
-                    emitter.emit(EVENTS.RATE_LIMIT_WARNING, { waitTime, endpoint });
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                    this.resetWindow(endpoint);
-                }
-
-                // Execute the request
-                window.requestCount++;
-                this.emit('debug', `Executing request for ${endpoint} (${window.requestCount}/${safeLimit})`);
-                emitter.emit(EVENTS.REQUEST_SCHEDULED, { endpoint });
-                
-                const result = await requestFn();
-                this.emit('debug', `Request completed for ${endpoint}`);
-                emitter.emit(EVENTS.REQUEST_COMPLETED, { endpoint });
-                resolve(result);
-        } catch (error) {
-                this.handleRequestError(error, endpoint, reject);
+            // Check if this is a batch request
+            const isBatchEndpoint = endpoint === 'tweets/search/recent';
+            if (isBatchEndpoint) {
+                return await this.handleBatchRequest(requestFn, limits, window);
             }
-        });
+
+            // Standard request handling
+            const now = Date.now();
+            const windowSize = limits.windowSizeMinutes * 60 * 1000;
+            if (now - window.startTime >= windowSize) {
+                this.resetWindow(endpoint);
+                window = this.getOrCreateWindow(endpoint);
+            }
+
+            // Check if we're within rate limits
+            const safeLimit = Math.floor(limits.requestsPerWindow * this.config.safetyMargin);
+            if (window.requestCount >= safeLimit) {
+                const waitTime = windowSize - (now - window.startTime);
+                this.emit('debug', `Rate limit approaching for ${endpoint}, waiting ${waitTime}ms`);
+                emitter.emit(EVENTS.RATE_LIMIT_WARNING, { waitTime, endpoint });
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                this.resetWindow(endpoint);
+                window = this.getOrCreateWindow(endpoint);
+            }
+
+            // Execute the request
+            window.requestCount++;
+            this.emit('debug', `Executing request for ${endpoint} (${window.requestCount}/${safeLimit})`);
+            emitter.emit(EVENTS.REQUEST_SCHEDULED, { endpoint });
+            
+            const result = await requestFn();
+            this.emit('debug', `Request completed for ${endpoint}`);
+            emitter.emit(EVENTS.REQUEST_COMPLETED, { endpoint });
+            return result;
+        } catch (error) {
+            this.handleRequestError(error, endpoint);
+            throw error;
+        }
     }
 
-    async handleBatchRequest(requestFn, limits, window, resolve, reject) {
+    async handleBatchRequest(requestFn, limits, window, endpoint = 'tweets/search/recent', requestId = Date.now().toString()) {
         try {
             const now = Date.now();
             const { minIntervalMs } = this.config.batchConfig;
@@ -114,7 +117,8 @@ class RateLimitManager extends EventEmitter {
             // Check and reset window if needed
             const windowSize = limits.windowSizeMinutes * 60 * 1000;
             if (now - window.startTime >= windowSize) {
-                this.resetWindow('tweets/search/recent');
+                this.resetWindow(endpoint);
+                window = this.getOrCreateWindow(endpoint);
             }
 
             // Check rate limits with aggressive safety margin
@@ -123,56 +127,66 @@ class RateLimitManager extends EventEmitter {
                 const waitTime = windowSize - (now - window.startTime);
                 this.emit('debug', `Batch rate limit approaching, waiting ${waitTime}ms`);
                 await new Promise(resolve => setTimeout(resolve, waitTime));
-                this.resetWindow('tweets/search/recent');
+                this.resetWindow(endpoint);
+                window = this.getOrCreateWindow(endpoint);
             }
 
             // Execute batch request
             window.requestCount++;
             this.state.batchState.lastBatchTime = Date.now();
+            this.emit('debug', `Executing batch request ${requestId} for ${endpoint} (${window.requestCount}/${safeLimit})`);
+            emitter.emit(EVENTS.REQUEST_SCHEDULED, { endpoint });
+            
             const result = await requestFn();
-            resolve(result);
+            
+            this.emit('debug', `Batch request ${requestId} completed for ${endpoint}`);
+            emitter.emit(EVENTS.REQUEST_COMPLETED, { endpoint });
+            return result;
 
         } catch (error) {
-            const retryCount = this.state.batchState.retryCount.get(window.startTime) || 0;
+            const retryCount = this.state.batchState.retryCount.get(requestId) || 0;
             
             if (error.code === 'RATE_LIMIT' && retryCount < this.config.batchConfig.maxRetries) {
-                this.state.batchState.retryCount.set(window.startTime, retryCount + 1);
-                this.emit('debug', `Retrying batch request (attempt ${retryCount + 1}/${this.config.batchConfig.maxRetries})`);
+                this.state.batchState.retryCount.set(requestId, retryCount + 1);
+                this.emit('debug', `Retrying batch request ${requestId} (attempt ${retryCount + 1}/${this.config.batchConfig.maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, this.config.batchConfig.retryDelayMs));
-                await this.handleBatchRequest(requestFn, limits, window, resolve, reject);
+                return this.handleBatchRequest(requestFn, limits, this.getOrCreateWindow(endpoint), endpoint, requestId);
             } else {
-                this.handleRequestError(error, 'tweets/search/recent', reject);
+                // Clean up retry counter
+                this.state.batchState.retryCount.delete(requestId);
+                this.handleRequestError(error, endpoint);
+                throw error;
             }
         }
     }
 
-    handleRequestError(error, endpoint, reject) {
+    handleRequestError(error, endpoint) {
         this.emit('debug', `Request failed for ${endpoint}: ${error.message}`);
-        this.emit('debug', `Error details: ${JSON.stringify(error, null, 2)}`);
         
-        const isTwitterRateLimit = 
-            (error.data?.errors?.some(e => e.code === 88)) ||
-            (error.rateLimit?.remaining === 0) ||
-            (error.code === 429 && 
-             error.data?.errors?.some(e => 
-                e.message?.toLowerCase().includes('rate limit') ||
-                e.message?.toLowerCase().includes('too many requests')
-             ));
+        const isRateLimit = 
+            error.code === 429 ||                                  // Standard HTTP rate limit
+            error.status === 429 ||                               // Alternative status field
+            error.response?.status === 429 ||                     // Axios error structure
+            (error.data?.errors?.some(e => e.code === 88)) ||     // Twitter specific
+            error.message?.toLowerCase().includes('rate limit') || // Generic message check
+            error.response?.data?.message?.toLowerCase().includes('rate limit');
 
-        if (isTwitterRateLimit) {
-            this.emit('debug', `Twitter rate limit hit for ${endpoint}, resetting window`);
+        if (isRateLimit) {
+            this.emit('debug', `Rate limit hit for ${endpoint}, resetting window`);
             emitter.emit(EVENTS.RATE_LIMIT_EXCEEDED, { endpoint });
             this.resetWindow(endpoint);
             
-            const rateError = new Error('Twitter API rate limit exceeded');
+            const rateError = new Error('API rate limit exceeded');
             rateError.code = 'RATE_LIMIT';
             rateError.endpoint = endpoint;
-            rateError.resetTime = error.rateLimit?.reset;
-            reject(rateError);
+            rateError.resetTime = error.rateLimit?.reset || 
+                                error.response?.headers?.['x-ratelimit-reset'] ||
+                                (Date.now() + 60000); // Default 1 minute
+            throw rateError;
         } else {
             this.emit('debug', `Non-rate-limit error for ${endpoint}: ${error.message}`);
             emitter.emit(EVENTS.REQUEST_FAILED, { error, endpoint });
-            reject(error);
+            throw error;
         }
     }
 }

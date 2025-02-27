@@ -48,14 +48,14 @@ const config = {
         clientId: process.env.DISCORD_CLIENT_ID || '',
         guildId: process.env.DISCORD_GUILD_ID || '',
         channels: {
-            tweets: process.env.DISCORD_TWEETS_CHANNEL_ID || '',
-            solana: process.env.DISCORD_SOLANA_CHANNEL_ID || '',
-            vip: process.env.DISCORD_VIP_CHANNEL_ID || '',
-            wallets: process.env.DISCORD_WALLETS_CHANNEL_ID || ''
+            tweets: process.env.DISCORD_TWEETS_CHANNEL || '',
+            solana: process.env.DISCORD_SOLANA_CHANNEL || '',
+            vip: process.env.DISCORD_VIP_CHANNEL || '',
+            wallets: process.env.DISCORD_WALLETS_CHANNEL || ''
         }
     },
     monitoring: {
-        interval: parseInt(process.env.MONITORING_INTERVAL_MS) || 60000,
+        interval: parseInt(process.env.MONITORING_INTERVAL) || 60000,
         maxAccountsPerBatch: parseInt(process.env.MAX_ACCOUNTS_PER_BATCH) || 25,
         maxTweetsPerAccount: parseInt(process.env.MAX_TWEETS_PER_ACCOUNT) || 5
     },

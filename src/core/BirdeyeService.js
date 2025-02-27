@@ -16,7 +16,7 @@ class BirdeyeRateLimitManager extends EventEmitter {
         };
     }
 
-    async scheduleRequest(requestFn) {
+    async scheduleRequest(requestFn, endpoint = 'default') {
         const now = Date.now();
         const windowSize = this.limit.windowSizeMinutes * 60 * 1000;
         
@@ -32,6 +32,7 @@ class BirdeyeRateLimitManager extends EventEmitter {
         const safeLimit = Math.floor(this.limit.requestsPerWindow * this.limit.safetyMargin);
         if (this.window.requestCount >= safeLimit) {
             const waitTime = windowSize - (now - this.window.startTime);
+            console.log(`[DEBUG] Rate limit approaching for ${endpoint}, waiting ${waitTime}ms`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
             this.window = {
                 startTime: Date.now(),
@@ -41,16 +42,17 @@ class BirdeyeRateLimitManager extends EventEmitter {
 
         // Execute request
         this.window.requestCount++;
+        console.log(`[DEBUG] Executing request for ${endpoint} (${this.window.requestCount}/${safeLimit})`);
         return await requestFn();
     }
 }
 
 class BirdeyeService {
-    constructor() {
+    constructor(apiKey) {
         // Use dedicated rate limit manager for Birdeye
         this.rateLimitManager = new BirdeyeRateLimitManager();
         this.baseUrl = 'https://public-api.birdeye.so';
-        this.apiKey = process.env.BIRDEYE_API_KEY;
+        this.apiKey = apiKey;
 
         // Standard headers for all requests
         this.headers = {
@@ -69,7 +71,7 @@ class BirdeyeService {
     // Simple token filtering
     shouldIncludeToken(token) {
         if (!token?.symbol) return false;
-        if (!token.network === 'solana') return false;
+        if (token.network !== 'solana') return false;
         return !this.blacklist.includes(token.symbol.toUpperCase());
     }
 

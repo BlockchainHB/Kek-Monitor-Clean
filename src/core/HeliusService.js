@@ -39,7 +39,10 @@ class HeliusRateLimitManager extends RateLimitManager {
 }
 
 class HeliusService {
-    constructor(apiKey, birdeyeService) {
+    constructor(apiKey, birdeyeService, config) {
+        if (!config?.discord?.channels?.wallets) {
+            throw new Error('Discord wallets channel configuration required');
+        }
         this.apiKey = apiKey;
         this.baseUrl = 'https://api.helius.xyz/v0';
         this.rateLimitManager = new HeliusRateLimitManager();
@@ -47,6 +50,12 @@ class HeliusService {
         this.walletNames = new Map(); // In-memory wallet name storage
         this.birdeyeService = birdeyeService; // Use provided Birdeye service
         this.walletsPath = path.join(__dirname, '../config/wallets.json');
+        this.config = config;
+
+        // Load wallets immediately
+        this.loadWalletsFromJson().catch(error => {
+            console.error('Failed to load initial wallets:', error);
+        });
     }
 
     // Add this new method
@@ -443,10 +452,10 @@ class HeliusService {
         try {
             console.log('[DEBUG] Received webhook data:', JSON.stringify(data, null, 2));
 
-            // Ensure we have the correct channel ID from environment
-            const WALLETS_CHANNEL = process.env.DISCORD_WALLETS_CHANNEL;
+            // Ensure we have the correct channel ID from config
+            const WALLETS_CHANNEL = this.config.discord.channels.wallets;
             if (!WALLETS_CHANNEL) {
-                console.error('[ERROR] DISCORD_WALLETS_CHANNEL not configured');
+                console.error('[ERROR] Wallets channel not configured in config');
                 return;
             }
 
@@ -479,17 +488,16 @@ class HeliusService {
 
                         // Handle SWAP transactions
                         if (transaction.type === 'SWAP') {
-                            const swapData = this.parseSwapTransaction(transaction);
-                            if (swapData) {
-                                notification = await this.formatSwapNotification({
-                                    ...swapData,
-                                    walletName
-                                });
+                            try {
+                                const swapData = this.parseSwapTransaction(transaction);
+                                if (swapData) {
+                                    notification = await this.formatSwapNotification({
+                                        ...swapData,
+                                        walletName
+                                    });
 
-                                // Send notification if we have one
-                                if (notification && this.onNotification) {
-                                    // Check if this is a high-value transaction (>= $1000)
-                                    const isHighValue = swapData.usdValue >= 1000;
+                                    // Check if this is a high-value transaction
+                                    const isHighValue = swapData.usdValue >= this.config.helius.minSmsSwapValue;
                                     await this.onNotification({
                                         content: isHighValue ? '@everyone High-value swap detected! 🔥' : null,
                                         embeds: [notification],
@@ -497,6 +505,8 @@ class HeliusService {
                                     });
                                     console.log('[DEBUG] Sent notification for swap transaction');
                                 }
+                            } catch (txError) {
+                                console.error('[ERROR] Error processing swap transaction:', txError);
                             }
                         } 
                         // Handle TRANSFER transactions
@@ -597,10 +607,10 @@ class HeliusService {
             }
 
             return {
-                title: totalUsdValue >= 1000 ? '🔥 High Value Transfer' : '💸 Token Transfer',
+                title: totalUsdValue >= this.config.helius.minSmsSwapValue ? '🔥 High Value Transfer' : '💸 Token Transfer',
                 description: `Transfer by ${walletName}${totalUsdValue > 0 ? ` worth $${this.formatUSD(totalUsdValue)}` : ''}`,
                 fields,
-                color: totalUsdValue >= 1000 ? 0xFF0000 : 0x9945FF,
+                color: totalUsdValue >= this.config.helius.minSmsSwapValue ? 0xFF0000 : 0x9945FF,
                 timestamp: new Date().toISOString()
             };
         } catch (error) {
@@ -641,6 +651,25 @@ class HeliusService {
         if (Math.abs(value) < 0.01) return value.toFixed(6);
         if (Math.abs(value) < 1) return value.toFixed(4);
         return value.toFixed(2);
+    }
+
+    async testConnection() {
+        try {
+            // Simple API test - get SOL balance of a known address
+            const response = await axios.get(
+                `${this.baseUrl}/addresses/So11111111111111111111111111111111111111112/balances?api-key=${this.apiKey}`
+            );
+            
+            if (response.status !== 200) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
+            console.log('[DEBUG] Helius API connection test successful');
+            return true;
+        } catch (error) {
+            console.error('[ERROR] Helius connection test failed:', error);
+            throw new Error('Failed to connect to Helius API');
+        }
     }
 }
 

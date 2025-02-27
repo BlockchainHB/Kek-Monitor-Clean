@@ -12,11 +12,31 @@ class TwitterMonitorBot {
     constructor(dependencies) {
         this.validateDependencies(dependencies);
         
+        // Initialize Discord client with required intents
+        this.client = new Client({ 
+            intents: [
+                GatewayIntentBits.Guilds,
+                GatewayIntentBits.GuildMessages,
+                GatewayIntentBits.MessageContent,
+                GatewayIntentBits.GuildMembers
+            ]
+        });
+        
         // Store core dependencies
-        this.client = dependencies.client;
         this.heliusService = dependencies.heliusService;
         this.birdeyeService = dependencies.birdeyeService;
         this.config = dependencies.config;
+
+        // Initialize Twitter client
+        this.twitter = new TwitterApi({
+            appKey: this.config.twitter.apiKey,
+            appSecret: this.config.twitter.apiKeySecret,
+            accessToken: this.config.twitter.accessToken,
+            accessSecret: this.config.twitter.accessTokenSecret
+        });
+
+        // Initialize rate limit manager with config
+        this.rateLimitManager = new RateLimitManager(this.config.twitter.rateLimit);
         
         // Simple runtime state - no persistence
         this.monitoredAccounts = new Map();
@@ -28,12 +48,23 @@ class TwitterMonitorBot {
         this.trackedTokens = new Map();
 
         // Initialize Twilio if credentials exist
-        if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-            this.twilioClient = twilio(
+        if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER) {
+            console.log('[DEBUG] Initializing Twilio with:', {
+                accountSid: process.env.TWILIO_ACCOUNT_SID?.slice(0,4) + '...',
+                phoneNumber: process.env.TWILIO_PHONE_NUMBER
+            });
+            this.twilio = twilio(
                 process.env.TWILIO_ACCOUNT_SID,
                 process.env.TWILIO_AUTH_TOKEN
             );
-            console.debug('Twilio client initialized');
+            this.twilioPhone = process.env.TWILIO_PHONE_NUMBER;
+            console.log('✅ Twilio client initialized');
+        } else {
+            console.log('[DEBUG] Twilio not configured - missing:', {
+                accountSid: !process.env.TWILIO_ACCOUNT_SID,
+                authToken: !process.env.TWILIO_AUTH_TOKEN,
+                phoneNumber: !process.env.TWILIO_PHONE_NUMBER
+            });
         }
 
         // Initialize channel properties as null
@@ -48,49 +79,58 @@ class TwitterMonitorBot {
         if (!deps.heliusService) throw new Error('HeliusService required');
         if (!deps.birdeyeService) throw new Error('BirdeyeService required');
         if (!deps.config) throw new Error('Config required');
+        if (!deps.rateLimitManager) throw new Error('RateLimitManager required for Twitter operations');
     }
 
     async start() {
         try {
-            console.log('Starting Twitter Monitor Bot...');
-            
-            // Login to Discord
-            await this.client.login(this.config.discordToken);
-            console.log('✅ Logged into Discord');
-
-            // Set up commands
-            await this.setupCommandHandling();
-            await this.registerCommands();
-            console.log('✅ Commands registered');
-
-            // Test channel access
+            // Validate channels
             await this.testChannelAccess();
-            console.log('✅ Channel access verified');
-
-            // Start monitoring systems
+            
+            // Register commands
+            await this.registerCommands();
+            
+            // Setup command handling
+            this.setupCommandHandling();
+            
+            // Load tracked wallets
+            await this.loadTrackedWallets();
+            
+            // Start monitoring
             await this.startMonitoring();
-            console.log('✅ Monitoring systems started');
-
-            console.log('🤖 Bot is ready!');
+            
+            console.log('TwitterMonitorBot started successfully');
         } catch (error) {
-            console.error('Failed to start bot:', error);
+            console.error('Error starting TwitterMonitorBot:', error);
             throw error;
         }
     }
 
     async testChannelAccess() {
         try {
-            const guild = await this.client.guilds.fetch(this.config.guildId);
+            console.log('[DEBUG] Testing channel access...');
             
-            this.tweetsChannel = await guild.channels.fetch(this.config.tweetsChannelId);
-            this.vipChannel = await guild.channels.fetch(this.config.vipChannelId);
-            this.walletsChannel = await guild.channels.fetch(this.config.walletsChannelId);
-            this.solanaChannel = await guild.channels.fetch(this.config.solanaChannelId);
-            
-            console.log('All channels accessed successfully');
+            // Get guild
+            const guild = this.client.guilds.cache.get(this.config.discord.guildId);
+            if (!guild) {
+                throw new Error(`Could not find guild with ID ${this.config.discord.guildId}`);
+            }
+            console.log('[DEBUG] Found guild:', guild.name);
+
+            // Fetch all channels at once
+            this.tweetsChannel = await guild.channels.fetch(this.config.discord.channels.tweets);
+            this.vipChannel = await guild.channels.fetch(this.config.discord.channels.vip);
+            this.walletsChannel = await guild.channels.fetch(this.config.discord.channels.wallets);
+            this.solanaChannel = await guild.channels.fetch(this.config.discord.channels.solana);
+
+            if (!this.tweetsChannel || !this.vipChannel || !this.walletsChannel || !this.solanaChannel) {
+                throw new Error('One or more channels not found');
+            }
+
+            console.log('[DEBUG] ✅ All channels accessed successfully');
         } catch (error) {
-            console.error('Failed to access channels:', error);
-            throw new Error('Channel access failed - please check channel IDs and bot permissions');
+            console.error('[DEBUG] Channel access error:', error);
+            throw new Error(`Channel access failed - ${error.message}`);
         }
     }
 
@@ -160,97 +200,46 @@ class TwitterMonitorBot {
         return Array.from(this.smsSubscribers.values());
     }
 
-    async checkAccount(account) {
+    async checkAccount(username) {
         try {
-            // Get last tweet ID
-            const lastTweet = await this.dbGet(
-                'SELECT last_tweet_id FROM monitored_accounts WHERE username = ?',
-                [account.username]
-            );
-            console.log(`[DEBUG] Last tweet ID for ${account.username}: ${lastTweet?.last_tweet_id || 'none'}`);
+            const cleanUsername = username.replace('@', '').trim();
+            console.log(`[DEBUG] Looking up account for ${cleanUsername}...`);
 
-            // Use optimized endpoint
-            console.log(`[DEBUG] Fetching tweets for ${account.username}...`);
+            const accountData = await this.rateLimitManager.scheduleRequest(
+                async () => {
+                    const user = await this.twitter.v2.userByUsername(cleanUsername);
+                    if (!user || !user.data) {
+                        throw new Error(`No Twitter user found for username: ${cleanUsername}`);
+                    }
+                    return user.data;
+                },
+                'users/by/username'
+            );
+
+            if (!accountData) {
+                console.log(`[DEBUG] No account found for ${cleanUsername}`);
+                return null;
+            }
+
+            // Fetch tweets with rate limiting
             const tweets = await this.rateLimitManager.scheduleRequest(
                 async () => {
-                    const params = {
-                        'tweet.fields': [
-                            'author_id',
-                            'created_at',
-                            'text',
-                            'attachments',
-                            'referenced_tweets',
-                            'in_reply_to_user_id',
-                            'conversation_id'
-                        ],
-                        'expansions': [
-                            'attachments.media_keys',
-                            'author_id',
-                            'referenced_tweets.id',
-                            'in_reply_to_user_id'
-                        ],
-                        'media.fields': ['url', 'preview_image_url', 'type'],
-                        'user.fields': ['profile_image_url', 'name', 'username'],
-                        'max_results': 100
-                    };
-                    
-                    if (lastTweet?.last_tweet_id) {
-                        params.since_id = lastTweet.last_tweet_id;
-                    }
-
-                    return await this.twitter.v2.userTimeline(account.twitter_id, params, {
-                        'endpoint': 'users/:id/tweets'  // Use correct endpoint
+                    return await this.twitter.v2.userTimeline(accountData.id, {
+                        max_results: this.config.monitoring.maxTweetsPerAccount,
+                        expansions: ['author_id', 'referenced_tweets.id'],
+                        'tweet.fields': ['created_at', 'text', 'referenced_tweets']
                     });
                 },
-                'users/:id/tweets'  // Use correct endpoint identifier
+                'users/:id/tweets'
             );
 
-            if (!tweets?.data?.length) {
-                console.log(`[DEBUG] No new tweets found for ${account.username}`);
-                return;
-            }
-
-            console.log(`[DEBUG] Found ${tweets.data.length} new tweets for ${account.username}`);
-
-            // Process tweets in order (newest to oldest)
-            for (const tweet of tweets.data.reverse()) {
-                console.log(`[DEBUG] Processing tweet ${tweet.id} from ${account.username}...`);
-                if (account.monitor_type === 'tweet') {
-                    await this.sendTweetNotification(tweet);
-                    console.log(`[DEBUG] Sent tweet notification for ${tweet.id}`);
-                } else if (account.monitor_type === 'solana') {
-                    const addresses = this.extractSolanaAddresses(tweet.text);
-                    if (addresses.length > 0) {
-                        console.log(`[DEBUG] Found ${addresses.length} Solana addresses in tweet ${tweet.id}`);
-                        for (const address of addresses) {
-                            await this.sendSolanaNotification({
-                                tweet_id: tweet.id,
-                                address,
-                                author_id: tweet.author_id,
-                                tweet_text: tweet.text
-                            });
-                            console.log(`[DEBUG] Sent Solana notification for address ${address}`);
-                        }
-                    }
-                }
-            }
-
-            // Update last tweet ID with the newest tweet
-            const newestTweetId = tweets.data[0]?.id;
-            if (newestTweetId) {
-                console.log(`[DEBUG] Updating last tweet ID for ${account.username} to ${newestTweetId}`);
-                await this.dbRun(
-                    'UPDATE monitored_accounts SET last_tweet_id = ? WHERE username = ?',
-                    [newestTweetId, account.username]
-                );
-            }
-
+            return {
+                account: accountData,
+                tweets: tweets.data || []
+            };
         } catch (error) {
-            if (error.code === 429) {
-                console.log(`[DEBUG] Rate limit hit for ${account.username}, will retry next interval`);
-                return;
-            }
-            console.error(`[ERROR] Error checking account ${account.username}:`, error);
+            console.error(`[ERROR] Failed to check account ${username}:`, error);
+            throw error;
         }
     }
 
@@ -262,73 +251,129 @@ class TwitterMonitorBot {
 
     async processTweet(tweet, account, includes) {
         try {
-            // Check if tweet was already processed
+            // Skip if already processed
             if (await this.isTweetProcessed(tweet.id)) {
                 return;
             }
 
-            // Extract Solana addresses from tweet text
-            const solanaAddresses = this.extractSolanaAddresses(tweet.text);
-            let contractFound = false;
+            // Get author info from includes
+            const author = includes.users?.find(u => u.id === tweet.author_id);
+            if (!author) {
+                console.error('[ERROR] Author not found in includes:', tweet);
+                return;
+            }
 
-            // Process Solana contracts if found
-            if (solanaAddresses.length > 0) {
-                for (const address of solanaAddresses) {
-                    try {
-                        // Let Birdeye validate and get token info
-                        const tokenInfo = await this.birdeyeService.getTokenInfo(address);
-                        if (tokenInfo) {
-                            contractFound = true;
-                            // Store token mention
-                            await this.addTokenMention(tweet.id, address);
-                            
-                            // Send contract notification with token info
-                            await this.sendSolanaNotification({
-                                tweet,
-                                account,
-                                includes,
-                                tokenInfo,
-                                address
-                            });
-
-                            // Send SMS alerts for contract detection
-                            const smsSubscribers = await this.getActiveSMSSubscribers();
-                            for (const subscriber of smsSubscribers) {
-                                await this.sendSMSAlert(
-                                    `🔔 New Solana contract detected in tweet from ${account.username}!\n${tokenInfo.symbol}: $${this.formatNumber(tokenInfo.price)}`,
-                                    subscriber.phone,
-                                    subscriber.discord_user_id
-                                );
-                            }
-                        }
-                    } catch (error) {
-                        console.error(`Error processing Solana address ${address}:`, error);
+            // Handle referenced tweet (reply/quote)
+            let referencedTweet = null;
+            if (tweet.referenced_tweets?.length > 0) {
+                const ref = tweet.referenced_tweets[0];
+                referencedTweet = includes.tweets?.find(t => t.id === ref.id);
+                if (referencedTweet) {
+                    const refAuthor = includes.users?.find(u => u.id === referencedTweet.author_id);
+                    if (refAuthor) {
+                        referencedTweet.author = refAuthor;
                     }
                 }
             }
 
-            // Send regular tweet notification
-            await this.sendTweetNotification(tweet, account, includes);
+            // Create base embed
+            const embed = {
+                color: 0x1DA1F2, // Twitter blue
+                author: {
+                    name: `${author.name} (@${author.username})`,
+                    icon_url: author.profile_image_url,
+                    url: `https://twitter.com/${author.username}`
+                },
+                description: tweet.text,
+                timestamp: tweet.created_at,
+                footer: {
+                    text: 'built by keklabs',
+                    icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
+                }
+            };
 
-            // Send SMS for VIP tweets
-            if (account.isVIP) {
-                const smsSubscribers = await this.getActiveSMSSubscribers();
-                for (const subscriber of smsSubscribers) {
-                    await this.sendSMSAlert(
-                        `🔔 New VIP tweet from ${account.username}!`,
-                        subscriber.phone,
-                        subscriber.discord_user_id
-                    );
+            // Add reply/quote content if exists
+            if (referencedTweet && referencedTweet.author) {
+                embed.fields = [{
+                    name: `Replying to @${referencedTweet.author.username}`,
+                    value: referencedTweet.text,
+                    inline: false
+                }];
+            }
+
+            // Check if VIP account
+            const isVIP = this.monitoredAccounts.get(account.id)?.isVIP || false;
+            
+            // Extract any Solana addresses
+            const solanaAddresses = this.extractSolanaAddresses(tweet.text);
+            let hasSolanaContent = false;
+
+            // Handle Solana token detection
+            if (solanaAddresses.length > 0) {
+                try {
+                    for (const address of solanaAddresses) {
+                        const tokenInfo = await this.birdeyeService.getTokenInfo(address);
+                        if (tokenInfo) {
+                            hasSolanaContent = true;
+                            // Add token info to embed
+                            embed.fields = embed.fields || [];
+                            embed.fields.push({
+                                name: `${tokenInfo.symbol} Token Info`,
+                                value: `Price: $${this.formatNumber(tokenInfo.price)}\nMC: $${this.formatNumber(tokenInfo.marketCap)}\n24h Volume: $${this.formatNumber(tokenInfo.volume24h)}`,
+                                inline: false
+                            });
+                            
+                            // Store token mention for tracking
+                            await this.addTokenMention(tweet.id, address);
+                        }
+                    }
+                } catch (error) {
+                    console.error('[ERROR] Birdeye token lookup failed:', error);
                 }
             }
 
-            // Mark tweet as processed and update last tweet ID
+            // Send to appropriate channels
+            try {
+                // VIP tweets go to VIP channel and SMS
+                if (isVIP) {
+                    await this.vipChannel.send({ embeds: [embed] });
+                    
+                    // Send SMS to all subscribers for VIP tweets
+                    const subscribers = await this.getActiveSMSSubscribers();
+                    for (const subscriber of subscribers) {
+                        await this.sendSMSAlert(
+                            `🔥 VIP Alert: New tweet from @${author.username}\n${tweet.text}`,
+                            subscriber.phone
+                        );
+                    }
+                }
+                
+                // Solana tweets go to Solana channel
+                if (hasSolanaContent) {
+                    await this.solanaChannel.send({ embeds: [embed] });
+                    
+                    // Send SMS for Solana token alerts
+                    const subscribers = await this.getActiveSMSSubscribers();
+                    for (const subscriber of subscribers) {
+                        await this.sendSMSAlert(
+                            `💎 Solana Token Alert: @${author.username} mentioned ${solanaAddresses.length} token(s)\n${tweet.text}`,
+                            subscriber.phone
+                        );
+                    }
+                }
+                
+                // All tweets go to main tweets channel
+                await this.tweetsChannel.send({ embeds: [embed] });
+
+            } catch (error) {
+                console.error('[ERROR] Failed to send tweet notifications:', error);
+            }
+
+            // Mark as processed
             await this.addProcessedTweet(tweet);
-            await this.updateLastTweetId(account.id, tweet.id);
 
         } catch (error) {
-            console.error('Error processing tweet:', error);
-            throw error;
+            console.error('[ERROR] Process tweet error:', error);
         }
     }
 
@@ -360,8 +405,8 @@ class TwitterMonitorBot {
                     url: `https://twitter.com/${author.username}`
                 },
                 footer: {
-                    text: "built by keklabs",
-                    icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                    text: 'built by keklabs',
+                    icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                 },
                 timestamp: new Date().toISOString()
             };
@@ -413,7 +458,7 @@ class TwitterMonitorBot {
 
                     await this.sendSMSAlert(
                         smsMessage,
-                        subscriber.phone_number,
+                        subscriber.phone,
                         subscriber.discord_user_id
                     );
                 }
@@ -455,8 +500,8 @@ class TwitterMonitorBot {
         };
 
         // Send to appropriate channels with @everyone for contract detection
-        if (this.channels.solana) {
-            await this.channels.solana.send({
+        if (this.solanaChannel) {
+            await this.solanaChannel.send({
                 content: '@everyone New Solana contract detected! 🚨',
                 embeds: [embed],
                 allowedMentions: { parse: ['everyone'] }
@@ -658,15 +703,18 @@ class TwitterMonitorBot {
 
     async handleMonitorCommand(interaction) {
         try {
-            const username = interaction.options.getString('username');
-            if (!username) {
+            const twitter_id = interaction.options.getString('twitter_id');
+            if (!twitter_id) {
                 await interaction.reply('Please provide a Twitter username to monitor.');
                 return;
             }
 
             await interaction.deferReply();
             
-            const account = await this.twitterRateLimitManager.scheduleRequest(
+            // Clean up username (remove @ if present and trim)
+            const username = twitter_id.replace('@', '').trim();
+            
+            const account = await this.rateLimitManager.scheduleRequest(
                 async () => {
                     const user = await this.twitter.v2.userByUsername(username);
                     return user.data;
@@ -692,7 +740,7 @@ class TwitterMonitorBot {
     async handleSolanaMonitorCommand(interaction) {
         try {
             await interaction.deferReply();
-            const account = interaction.options.getString('account');
+            const account = interaction.options.getString('twitter_id');
 
             // Validate account
             const accountData = await this.checkAccount(account);
@@ -720,15 +768,18 @@ class TwitterMonitorBot {
 
     async handleVIPMonitorCommand(interaction) {
         try {
-            const username = interaction.options.getString('username');
-            if (!username) {
+            const twitter_id = interaction.options.getString('twitter_id');
+            if (!twitter_id) {
                 await interaction.reply('Please provide a Twitter username to monitor.');
                 return;
             }
 
             await interaction.deferReply();
 
-            const account = await this.twitterRateLimitManager.scheduleRequest(
+            // Clean up username (remove @ if present and trim)
+            const username = twitter_id.replace('@', '').trim();
+
+            const account = await this.rateLimitManager.scheduleRequest(
                 async () => {
                     const user = await this.twitter.v2.userByUsername(username);
                     return user.data;
@@ -773,7 +824,7 @@ class TwitterMonitorBot {
             }
 
             // Remove account from monitoring
-            await this.removeMonitoredAccount(account.twitter_id);
+            await this.removeMonitoredAccount(account.id);
 
             return await interaction.reply({
                 embeds: [{
@@ -782,7 +833,7 @@ class TwitterMonitorBot {
                     fields: [
                         {
                             name: 'Account Type',
-                            value: account.is_vip ? '⭐ VIP Account' : account.monitoring_type === 'solana' ? '🔍 Solana Monitor' : '📝 Tweet Monitor',
+                            value: account.isVIP ? '⭐ VIP Account' : account.monitor_type === 'solana' ? '🔍 Solana Monitor' : '📝 Tweet Monitor',
                             inline: true
                         }
                     ],
@@ -797,14 +848,14 @@ class TwitterMonitorBot {
         } catch (error) {
             console.error('[ERROR] Stop monitor command error:', error);
             
-            await interaction.editReply({
+            return await interaction.reply({
                 embeds: [{
                     title: "Command Error",
                     description: `❌ An error occurred while stopping the monitor`,
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -825,8 +876,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch trending tokens at this time.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -846,8 +897,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch trending tokens",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 };
 
@@ -875,8 +926,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch top gainers at this time.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -892,8 +943,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch top gainers",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -913,8 +964,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch top losers at this time.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -930,8 +981,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch top losers",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -951,8 +1002,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch new pairs at this time.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -968,8 +1019,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch new pairs",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -989,8 +1040,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch volume leaders at this time.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -1006,8 +1057,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch volume leaders",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -1064,8 +1115,8 @@ class TwitterMonitorBot {
                     }
                 ],
                 footer: {
-                    text: "built by keklabs",
-                    icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                    text: 'built by keklabs',
+                    icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                 },
                 timestamp: new Date().toISOString()
             };
@@ -1079,8 +1130,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to display help information",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -1100,8 +1151,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch security information for this token.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -1117,8 +1168,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch security information",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -1138,8 +1189,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch metrics information for this token.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -1155,8 +1206,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch metrics information",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -1181,8 +1232,8 @@ class TwitterMonitorBot {
                         description: 'Could not fetch holder information for this token.',
                         color: 0xFF0000,
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         }
                     }]
                 });
@@ -1198,8 +1249,8 @@ class TwitterMonitorBot {
                     description: "❌ Failed to fetch holder information",
                     color: 0xFF0000,
                     footer: {
-                        text: "built by keklabs",
-                        icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                     }
                 }]
             });
@@ -1208,10 +1259,13 @@ class TwitterMonitorBot {
 
     async handleSMSAlertCommand(interaction) {
         try {
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: ['Ephemeral'] });
             
             if (!this.twilio || !this.twilioPhone) {
-                await interaction.editReply('❌ SMS alerts are not configured. Please contact the administrator.');
+                await interaction.editReply({ 
+                    content: '❌ SMS alerts are not configured. Please contact the administrator.',
+                    flags: ['Ephemeral']
+                });
                 return;
             }
 
@@ -1227,18 +1281,24 @@ class TwitterMonitorBot {
             // Send test message
             await this.sendSMSAlert('🔔 SMS alerts configured successfully! You will now receive notifications for high-value transactions.', phone);
 
-            await interaction.editReply('✅ SMS alerts configured successfully! You should receive a test message shortly.');
+            await interaction.editReply({ 
+                content: '✅ SMS alerts configured successfully! You should receive a test message shortly.',
+                flags: ['Ephemeral']
+            });
             console.log(`[DEBUG] Added SMS subscriber: ${userId} with phone: ${phone}`);
 
         } catch (error) {
             console.error('[ERROR] SMS alert command error:', error);
-            await interaction.editReply('❌ Failed to configure SMS alerts. Please try again.');
+            await interaction.editReply({ 
+                content: '❌ Failed to configure SMS alerts. Please try again.',
+                flags: ['Ephemeral']
+            });
         }
     }
 
     async handleStopSMSCommand(interaction) {
         try {
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: ['Ephemeral'] });
             const phone = interaction.options.getString('phone');
 
             // Remove from in-memory state
@@ -1260,7 +1320,10 @@ class TwitterMonitorBot {
 
         } catch (error) {
             console.error('[ERROR] Stop SMS command error:', error);
-            await interaction.editReply('❌ Failed to unsubscribe from SMS alerts. Please try again.');
+            await interaction.editReply({ 
+                content: '❌ Failed to unsubscribe from SMS alerts. Please try again.',
+                flags: ['Ephemeral']
+            });
         }
     }
 
@@ -1268,30 +1331,116 @@ class TwitterMonitorBot {
         try {
             await interaction.deferReply();
             
-            // Test services status
             const services = [];
+            const tests = [];
             
-            // Test Discord
+            // Test Discord Connection & Permissions
             services.push('💬 Discord: Connected');
-            
-            // Test SMS
-            if (this.twilio && this.twilioPhone) {
-                services.push('📱 SMS: Configured');
-            } else {
-                services.push('📱 SMS: Not configured');
+            try {
+                await interaction.channel.send('🔄 Testing message permissions...');
+                services.push('✅ Discord Permissions: OK');
+            } catch (error) {
+                services.push('❌ Discord Permissions: Failed');
+                tests.push(`Discord Error: ${error.message}`);
             }
 
-            // Format response
-            const response = [
-                '📊 Services:',
-                ...services
-            ].join('\n');
+            // Test Channel Access
+            const channels = {
+                '📢 Tweets': this.tweetsChannel,
+                '⭐ VIP': this.vipChannel,
+                '👛 Wallets': this.walletsChannel,
+                '💎 Solana': this.solanaChannel
+            };
 
-            await interaction.editReply(response);
+            for (const [name, channel] of Object.entries(channels)) {
+                if (channel && channel.id) {
+                    services.push(`✅ ${name} Channel: ${channel.name}`);
+                } else {
+                    services.push(`❌ ${name} Channel: Not Found`);
+                }
+            }
+
+            // Test SMS Configuration
+            if (this.twilio && this.twilioPhone) {
+                services.push('✅ SMS: Configured');
+                services.push(`📱 SMS Number: ${this.twilioPhone}`);
+            } else {
+                services.push('❌ SMS: Not Configured');
+            }
+
+            // Test Birdeye API
+            try {
+                await this.birdeyeService.getTrendingTokens();
+                services.push('✅ Birdeye API: Connected');
+            } catch (error) {
+                services.push('❌ Birdeye API: Failed');
+                tests.push(`Birdeye Error: ${error.message}`);
+            }
+
+            // Test Helius API
+            try {
+                await this.heliusService.testConnection();
+                services.push('✅ Helius API: Connected');
+            } catch (error) {
+                services.push('❌ Helius API: Failed');
+                tests.push(`Helius Error: ${error.message}`);
+            }
+
+            // Monitor Stats
+            const stats = [
+                `📊 Monitored Accounts: ${this.monitoredAccounts.size}`,
+                `👛 Tracked Wallets: ${this.trackedWallets.size}`,
+                `📱 SMS Subscribers: ${this.smsSubscribers.size}`,
+                `🔄 Monitoring Interval: ${this.config.monitoring.interval}ms`
+            ];
+
+            // Create embed
+            const embed = {
+                title: '🤖 Bot Status Report',
+                color: tests.length > 0 ? 0xFFA500 : 0x00FF00, // Orange if errors, green if all good
+                fields: [
+                    {
+                        name: '📡 Services',
+                        value: services.join('\n'),
+                        inline: false
+                    },
+                    {
+                        name: '📈 Statistics',
+                        value: stats.join('\n'),
+                        inline: false
+                    }
+                ],
+                footer: {
+                    text: 'built by keklabs',
+                    icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
+                },
+                timestamp: new Date().toISOString()
+            };
+
+            // Add test failures if any occurred
+            if (tests.length > 0) {
+                embed.fields.push({
+                    name: '⚠️ Test Failures',
+                    value: tests.join('\n'),
+                    inline: false
+                });
+            }
+
+            await interaction.editReply({ embeds: [embed] });
 
         } catch (error) {
             console.error('[ERROR] Test notification error:', error);
-            await interaction.editReply('❌ Error testing notifications');
+            await interaction.editReply({
+                embeds: [{
+                    title: '❌ Test Failed',
+                    description: 'Error running tests',
+                    color: 0xFF0000,
+                    footer: {
+                        text: 'built by keklabs',
+                        icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
+                    }
+                }]
+            });
         }
     }
 
@@ -1316,50 +1465,27 @@ class TwitterMonitorBot {
         }
     }
 
-    async shutdown() {
-        try {
-            // Clear monitoring interval
-            if (this.monitoringInterval) {
-                clearInterval(this.monitoringInterval);
-                this.monitoringInterval = null;
-            }
-
-            // Close database connection if open
-            if (this.db) {
-                try {
-                    await new Promise((resolve, reject) => {
-                        this.db.close(err => {
-                            if (err && err.code !== 'SQLITE_MISUSE') {
-                                reject(err);
-                            } else {
-                                resolve();
-                            }
-                        });
-                    });
-                } catch (error) {
-                    if (error.code !== 'SQLITE_MISUSE') {
-                        throw error;
-                    }
-                }
-                this.db = null;
-            }
-
-            // Destroy Discord client
-            if (this.client) {
-                await this.client.destroy();
-            }
-
-            console.log('Bot shutdown complete');
-        } catch (error) {
-            console.error('Error during shutdown:', error);
-            throw error;
-        }
-    }
-
     async registerCommands() {
         try {
-            console.log('🔄 Registering application commands...');
+            console.log('🔄 Checking application commands...');
             
+            // Get the guild
+            const guild = await this.client.guilds.fetch(this.config.discord.guildId);
+            if (!guild) {
+                throw new Error(`Could not find guild with ID ${this.config.discord.guildId}`);
+            }
+
+            console.log(`Found guild: ${guild.name}`);
+
+            // Check existing commands
+            const existingCommands = await guild.commands.fetch();
+            if (existingCommands.size > 0) {
+                console.log('✅ Commands already registered, skipping registration');
+                return;
+            }
+
+            console.log('📝 Registering new commands...');
+
             const commands = [
                 {
                     name: 'monitor',
@@ -1409,7 +1535,7 @@ class TwitterMonitorBot {
             name: 'trackwallet',
             description: 'Track a Solana wallet',
                     options: [{
-                        name: 'address',
+                        name: 'wallet',
                     description: 'Solana wallet address to track',
                         type: ApplicationCommandOptionType.String,
                     required: true
@@ -1419,7 +1545,7 @@ class TwitterMonitorBot {
             name: 'stopwallet',
                     description: 'Stop tracking a Solana wallet',
                     options: [{
-                        name: 'address',
+                        name: 'wallet',
                     description: 'Solana wallet address to stop tracking',
                         type: ApplicationCommandOptionType.String,
                     required: true
@@ -1554,17 +1680,13 @@ class TwitterMonitorBot {
                 }
             ];
 
-            // Register commands with Discord
-            const guild = await this.client.guilds.fetch(this.config.guildId);
-            if (!guild) {
-                throw new Error('Guild not found during command registration');
-            }
-
+            // Only register if no commands exist
             await guild.commands.set(commands);
             console.log('✅ Application commands registered successfully');
         } catch (error) {
-            console.error('❌ Error registering commands:', error);
-            throw error;
+            console.error('❌ Error checking/registering commands:', error);
+            // Don't throw error, just log it - this allows the bot to continue if commands already exist
+            console.log('Continuing bot startup...');
         }
     }
 
@@ -1718,10 +1840,10 @@ class TwitterMonitorBot {
     }
 
     async handleTrackWalletCommand(interaction) {
-        try {
-            const address = interaction.options.getString('address');
-            const name = interaction.options.getString('name');
+        const address = interaction.options.getString('wallet');
+        const name = interaction.options.getString('name');
 
+        try {
             if (!this.heliusService.isValidSolanaAddress(address)) {
                 await interaction.reply('Please provide a valid Solana wallet address.');
                 return;
@@ -1746,7 +1868,7 @@ class TwitterMonitorBot {
 
     async handleStopWalletCommand(interaction) {
         try {
-            const address = interaction.options.getString('address');
+            const address = interaction.options.getString('wallet');
 
             if (!this.trackedWallets.has(address)) {
                 await interaction.reply('This wallet is not being tracked.');
@@ -1779,9 +1901,9 @@ class TwitterMonitorBot {
             for (const transaction of data) {
                 try {
                     // Get wallet info from tracked wallets
-                    const wallet = this.trackedWallets.get(transaction.accountData.account);
+                    const wallet = this.trackedWallets.get(transaction.account);
                     if (!wallet) {
-                        console.log('[DEBUG] Transaction for untracked wallet:', transaction.accountData.account);
+                        console.log('[DEBUG] Transaction for untracked wallet:', transaction.account);
                         continue;
                     }
 
@@ -1789,38 +1911,11 @@ class TwitterMonitorBot {
                     let totalUsdValue = 0;
                     let isStablecoinPurchase = false;
                     
-                    // Add SOL value if present
-                    if (transaction.amount && transaction.nativeTransfers) {
-                        const solPrice = await this.helius.getSolanaPrice();
-                        totalUsdValue += transaction.amount * solPrice;
-                    }
-
-                    // Add token transfer value if present
-                    if (transaction.tokenTransfers?.length > 0) {
-                        for (const transfer of transaction.tokenTransfers) {
-                            if (transfer.tokenPrice) {
-                                totalUsdValue += transfer.tokenAmount * transfer.tokenPrice;
-                            }
-                            
-                            // Check if this is a stablecoin purchase
-                            const stablecoins = ['USDC', 'USDT', 'DAI', 'BUSD'];
-                            if (stablecoins.includes(transfer.tokenSymbol?.toUpperCase())) {
-                                isStablecoinPurchase = true;
-                            }
-                        }
-                    }
-
-                    // Skip if it's a stablecoin purchase
-                    if (isStablecoinPurchase) {
-                        console.log('[DEBUG] Skipping stablecoin purchase transaction');
-                        continue;
-                    }
-
-                    // Create transaction embed
+                    // Create transaction embed first
                     const embed = {
-                        title: totalUsdValue >= 1000 ? '🔥 High Value Transaction' : '🔔 New Transaction',
-                        description: `Activity detected for wallet:\n\`${transaction.accountData.account}\``,
-                        color: totalUsdValue >= 1000 ? 0xFF0000 : 0x9945FF,
+                        title: '🔔 New Transaction',
+                        description: `Activity detected for wallet:\n\`${transaction.account}\``,
+                        color: 0x9945FF,
                         fields: [
                             {
                                 name: 'Transaction Type',
@@ -1829,19 +1924,59 @@ class TwitterMonitorBot {
                             }
                         ],
                         footer: {
-                            text: "built by keklabs",
-                            icon_url: "https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png"
+                            text: 'built by keklabs',
+                            icon_url: 'https://media.discordapp.net/attachments/1337565019218378864/1342687517719269489/ddd006d6-fef8-46c4-83eb-5faa63887089.png'
                         },
                         timestamp: new Date().toISOString()
                     };
 
-                    // Add SOL amount if present
-                    if (transaction.amount) {
+                    // Check if there are token transfers once
+                    const hasTokenTransfers = transaction.tokenTransfers?.length > 0;
+                    const tokenTransfers = hasTokenTransfers ? transaction.tokenTransfers : [];
+                    
+                    // Check for stablecoin purchases first
+                    if (hasTokenTransfers) {
+                        for (const transfer of tokenTransfers) {
+                            const stablecoins = ['USDC', 'USDT', 'DAI', 'BUSD'];
+                            if (stablecoins.includes(transfer.tokenSymbol?.toUpperCase())) {
+                                isStablecoinPurchase = true;
+                                console.log('[DEBUG] Skipping stablecoin purchase transaction');
+                                break;
+                            }
+                        }
+                    }
+
+                    // Skip early if it's a stablecoin purchase
+                    if (isStablecoinPurchase) {
+                        continue;
+                    }
+                    
+                    // Add SOL value if present
+                    if (transaction.amount && transaction.nativeTransfers) {
+                        const solPrice = await this.heliusService.getSolanaPrice();
+                        totalUsdValue += transaction.amount * solPrice;
+
+                        // Add SOL amount to embed
                         embed.fields.push({
                             name: 'SOL Amount',
                             value: `${this.formatNumber(transaction.amount)} SOL`,
                             inline: true
                         });
+                    }
+
+                    // Now process token transfer values
+                    if (hasTokenTransfers) {
+                        for (const transfer of tokenTransfers) {
+                            if (transfer.tokenPrice) {
+                                totalUsdValue += transfer.tokenAmount * transfer.tokenPrice;
+                            }
+                        }
+                    }
+
+                    // Update embed title and color based on final total value
+                    if (totalUsdValue >= 1000) {
+                        embed.title = '🔥 High Value Transaction';
+                        embed.color = 0xFF0000;
                     }
 
                     // Add USD value
@@ -1857,19 +1992,28 @@ class TwitterMonitorBot {
                     }
 
                     // Add token info if available
-                    if (transaction.tokenTransfers?.length > 0) {
-                        const tokenTransfer = transaction.tokenTransfers[0];
+                    if (hasTokenTransfers) {
+                        const tokenTransfer = tokenTransfers[0];
                         
                         // Get enhanced token info from Birdeye
                         let tokenInfo = null;
+                        const tokenFields = [];
+                        
                         try {
                             tokenInfo = await this.birdeyeService.getTokenInfo(tokenTransfer.mint);
                         } catch (error) {
                             console.error('[ERROR] Failed to fetch Birdeye data:', error);
                         }
+
+                        // Add token section header
+                        embed.fields.push({
+                            name: '💎 Token Information',
+                            value: '─'.repeat(20),
+                            inline: false
+                        });
                         
                         // Add token info fields
-                        const tokenFields = [
+                        tokenFields.push(
                             {
                                 name: 'Token',
                                 value: tokenTransfer.tokenName || 'Unknown Token',
@@ -1880,7 +2024,7 @@ class TwitterMonitorBot {
                                 value: `${this.formatNumber(tokenTransfer.tokenAmount)} ${tokenTransfer.tokenSymbol || ''}`,
                                 inline: true
                             }
-                        ];
+                        );
                         
                         // Add Birdeye metrics if available
                         if (tokenInfo) {
@@ -1942,19 +2086,19 @@ class TwitterMonitorBot {
                     await channel.send({ embeds: [embed] });
 
                     // Send SMS only if value is over $1000 and SMS is enabled
-                    if (totalUsdValue >= 1000 && this.config.twilio.enabled && wallet.discord_user_id) {
-                        const subscriber = await this.getSMSSubscriber(wallet.discord_user_id);
+                    if (totalUsdValue >= 1000 && this.config.twilio.enabled && wallet.added_by) {
+                        const subscriber = await this.getSMSSubscriber(wallet.added_by);
                         if (subscriber) {
                             const smsMessage = `🔥 High Value Transaction ($${this.formatNumber(totalUsdValue)})!\n` +
                                 `Type: ${transaction.type || 'Unknown'}\n` +
-                                (transaction.amount ? `SOL Amount: ${this.formatNumber(transaction.amount)} SOL\n` : '') +
+                                ((transaction.amount && transaction.nativeTransfers) ? `SOL Amount: ${this.formatNumber(transaction.amount)} SOL\n` : '') +
                                 (transaction.tokenTransfers?.[0] ? `Token: ${transaction.tokenTransfers[0].tokenSymbol}\n` : '') +
                                 (transaction.signature ? `\nhttps://solscan.io/tx/${transaction.signature}` : '');
 
                             await this.sendSMSAlert(
                                 smsMessage,
-                                subscriber.phone_number,
-                                wallet.discord_user_id
+                                subscriber.phone,
+                                wallet.added_by
                             );
                         }
                     }
@@ -2008,76 +2152,101 @@ class TwitterMonitorBot {
     async batchProcessTweets(accounts) {
         try {
             for (const account of accounts) {
-                const lastCheck = this.lastSearchTime.get(account.id) || 0;
-                const now = Date.now();
-                const lastTweetId = this.monitoredAccounts.get(account.id)?.lastTweetId;
-
-                // Only check if enough time has passed
-                if (now - lastCheck < this.monitoringInterval) {
-                    continue;
-                }
-
-                await this.twitterRateLimitManager.scheduleRequest(
+                await this.rateLimitManager.scheduleRequest(
                     async () => {
-                        const params = {
-                            ...this.searchConfig,
-                            since_id: lastTweetId
-                        };
+                        // Enhanced tweet lookup parameters
+                        const tweets = await this.twitter.v2.userTimeline(account.id, {
+                            max_results: account.lastTweetId ? 100 : 5, // 5 for first fetch, 100 for updates
+                            since_id: account.lastTweetId || undefined,
+                            tweet_fields: [
+                                'created_at',
+                                'entities',
+                                'public_metrics',
+                                'referenced_tweets',
+                                'conversation_id'
+                            ],
+                            expansions: [
+                                'author_id',
+                                'referenced_tweets.id',
+                                'referenced_tweets.id.author_id',
+                                'in_reply_to_user_id',
+                                'attachments.media_keys'
+                            ],
+                            user_fields: [
+                                'name',
+                                'username',
+                                'profile_image_url'
+                            ],
+                            media_fields: [
+                                'url',
+                                'preview_image_url'
+                            ]
+                        });
 
-                        const tweets = await this.twitter.v2.userTimeline(account.id, params);
-                        if (tweets.data) {
-                            // Process tweets in chronological order
-                            for (const tweet of tweets.data.reverse()) {
-                                await this.processTweet(tweet, account, tweets.includes);
-                            }
+                        if (!tweets.data?.length) {
+                            return; // No new tweets
                         }
+
+                        // Process tweets in chronological order
+                        const sortedTweets = tweets.data.sort((a, b) => 
+                            new Date(a.created_at) - new Date(b.created_at)
+                        );
+
+                        for (const tweet of sortedTweets) {
+                            await this.processTweet(tweet, account, tweets.includes);
+                        }
+
+                        // Update last tweet ID with the most recent one
+                        await this.updateLastTweetId(account.id, sortedTweets[sortedTweets.length - 1].id);
                     },
                     'users/:id/tweets'
                 );
-
-                this.lastSearchTime.set(account.id, now);
             }
         } catch (error) {
-            if (error.code === 'RATE_LIMIT') {
-                console.log('Rate limit hit, will retry on next interval');
-                return;
-            }
-            console.error('Error processing tweets batch:', error);
-            throw error; // Propagate error to be handled by the monitoring loop
+            console.error('[ERROR] Batch process tweets error:', error);
         }
     }
 
-    async handleSolanaMonitorCommand(interaction) {
-        try {
-            await interaction.deferReply();
-            const account = interaction.options.getString('account');
 
-            // Validate account
-            const accountData = await this.checkAccount(account);
-            if (!accountData) {
-                await interaction.editReply('❌ Invalid Twitter account. Please check the username and try again.');
+
+    async handleWalletMonitorCommand(interaction) {
+        try {
+            const address = interaction.options.getString('wallet');
+            if (!address) {
+                await interaction.reply({
+                    content: 'Please provide a wallet address to monitor.',
+                    ephemeral: true
+                });
                 return;
             }
 
-            // Store account with type 'solana'
-            await this.addMonitoredAccount({
-                id: accountData.id,
-                username: accountData.username,
-                monitor_type: 'solana',
-                last_tweet_id: null
+            // Validate Solana address format
+            if (!this.heliusService.isValidSolanaAddress(address)) {
+                await interaction.reply({
+                    content: 'Invalid Solana wallet address format.',
+                    ephemeral: true
+                });
+                return;
+            }
+
+            // Add wallet to tracking
+            const name = interaction.options.getString('name') || `Wallet-${address.slice(0, 4)}`;
+            this.heliusService.setWalletName(address, name);
+
+            await interaction.reply({
+                content: `Now monitoring wallet ${name} (${address})`,
+                ephemeral: true
             });
 
-            await interaction.editReply(`✅ Now monitoring Solana-related tweets from @${accountData.username}`);
-            console.log(`[DEBUG] Added monitored account: ${accountData.username} (type: solana)`);
-
+            // Update webhook with new wallet
+            await this.setupHeliusWebhook();
         } catch (error) {
-            console.error('[ERROR] Solana monitor command error:', error);
-            await interaction.editReply('❌ Failed to start monitoring. Please try again.');
+            console.error('[ERROR] Failed to handle wallet monitor command:', error);
+            await interaction.reply({
+                content: 'Failed to start monitoring wallet. Please try again later.',
+                ephemeral: true
+            });
         }
-    }
-
-    async loadTrackedWallets() {
-        return Array.from(this.trackedWallets.values());
     }
 }
 

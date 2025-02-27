@@ -1,10 +1,17 @@
 {
   "name": "kek-monitor",
   "version": "1.0.0",
+  "description": "Discord bot for monitoring Twitter accounts and Solana wallets",
   "private": true,
   "scripts": {
     "start": "node src/index.js",
-    "build": "npm install --omit=dev"
+    "dev": "NODE_ENV=development nodemon src/index.js",
+    "build": "npm install --omit=dev",
+    "check-limits": "node src/utils/check_limits.js",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "test": "echo \"No tests specified\" && exit 0",
+    "prepare": "husky install"
   },
   "dependencies": {
     "axios": "^1.6.5",
@@ -12,9 +19,39 @@
     "dotenv": "^16.4.1",
     "node-fetch": "^2.7.0",
     "twilio": "^4.20.1",
-    "twitter-api-v2": "^1.15.2"
+    "twitter-api-v2": "^1.15.2",
+    "events": "^3.3.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.56.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.1",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.1.1",
+    "husky": "^8.0.3",
+    "lint-staged": "^15.2.0",
+    "nodemon": "^3.0.3"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/kek-monitor.git"
+  },
+  "keywords": [
+    "discord",
+    "twitter",
+    "solana",
+    "monitoring",
+    "crypto",
+    "helius",
+    "birdeye",
+    "webhook"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "lint-staged": {
+    "*.js": "eslint --cache --fix"
   }
 }

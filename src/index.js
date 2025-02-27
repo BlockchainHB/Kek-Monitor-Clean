@@ -22,7 +22,7 @@ async function main() {
 
         // Initialize services
         const birdeyeService = new BirdeyeService(config.birdeye.apiKey);
-        const heliusService = new HeliusService(process.env.HELIUS_API_KEY, birdeyeService);
+        const heliusService = new HeliusService(config.helius.apiKey, birdeyeService, config);
 
         // Initialize bot with dependencies
         const bot = new TwitterMonitorBot({
@@ -34,10 +34,6 @@ async function main() {
 
         // Start the bot
         await bot.start();
-
-        // Should have these for clean shutdown:
-        process.on('SIGINT', shutdown);
-        process.on('SIGTERM', shutdown);
 
     } catch (error) {
         console.error('❌ Fatal error:', error);
